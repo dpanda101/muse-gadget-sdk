@@ -19,7 +19,14 @@
  * CST816 touch, ES8311 speaker DAC + ES7210 mic ADC, TCA9554 I/O expander (display
  * and touch resets live on its EXIO2/EXIO1 pins), no PMU. BOOT (GPIO0) is the
  * talk button; holding a finger on the face tile also talks.
+ *
+ * CONFIG_MUSE_WAVESHARE_S3_185_PCM5101 builds the plain 1.85 (no C): the same
+ * panel, touch and expander, but a PCM5101A I2S DAC for the speaker and a MEMS
+ * mic on a second I2S bus, wired like the Waveshare 1.46 (board_waveshare_s3_146.c).
+ * There GPIO15 is the mic's clock, not an amplifier enable.
  */
+#include <math.h>
+
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -67,6 +74,13 @@ static const char *TAG = "board";
 #define I2C_SDA GPIO_NUM_11
 #define I2C_SCL GPIO_NUM_10
 #define TOUCH_INT GPIO_NUM_4
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+/* The plain 1.85's CST816 doesn't answer on the expander's bus: it is looked
+ * for there first, then on a bus of its own on these pins. */
+#define TP_ALT_SDA GPIO_NUM_1
+#define TP_ALT_SCL GPIO_NUM_3
+#define CST816_ADDR 0x15
+#endif
 
 #define TCA9554_ADDR 0x20
 #define TCA9554_INPUT_REG 0x00
@@ -75,12 +89,24 @@ static const char *TAG = "board";
 #define EXIO_TOUCH_RST_BIT BIT(0)   /* EXIO1, to the CST816 */
 #define EXIO_LCD_RST_BIT BIT(1)     /* EXIO2, to the ST77916 */
 
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+/* Speaker: PCM5101A on its own I2S bus, no MCLK (its PLL runs from BCLK). */
+#define SPK_BCLK GPIO_NUM_48
+#define SPK_WS GPIO_NUM_38
+#define SPK_DOUT GPIO_NUM_47
+/* Mic: MEMS I2S mic on a second bus. */
+#define MIC_BCLK GPIO_NUM_15
+#define MIC_WS GPIO_NUM_2
+#define MIC_DIN GPIO_NUM_39
+#define MIC_GAIN_OFFSET_DB 0
+#else
 #define I2S_MCLK GPIO_NUM_2
 #define I2S_BCLK GPIO_NUM_48
 #define I2S_WS GPIO_NUM_38
 #define I2S_DOUT GPIO_NUM_47   /* to the ES8311 DAC */
 #define I2S_DIN GPIO_NUM_39    /* from the mic */
 #define PA_EN GPIO_NUM_15
+#endif
 
 #define BATT_ADC ADC_CHANNEL_7  /* GPIO8 */
 
@@ -143,9 +169,19 @@ static esp_err_t init(void)
         .scl_speed_hz = 400000,
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c, &tca_cfg, &s_tca), TAG, "tca9554");
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+    /* As on the 1.46: only the two resets and EXIO3 (the SD card's CS) are
+     * driven, high; the rest stay inputs, so nothing here drives against the
+     * IMU's interrupt lines or holds the speaker amplifier in mute. */
+    ESP_RETURN_ON_ERROR(tca_write(TCA9554_OUTPUT_REG, 0xFF), TAG, "tca outputs");
+    ESP_RETURN_ON_ERROR(tca_write(TCA9554_CONFIG_REG,
+                                  (uint8_t)~(EXIO_LCD_RST_BIT | EXIO_TOUCH_RST_BIT | BIT(2))),
+                        TAG, "tca config");
+#else
     /* All pins output; leave every line high, then pulse the reset lines. */
     ESP_RETURN_ON_ERROR(tca_write(TCA9554_CONFIG_REG, 0x00), TAG, "tca config");
     ESP_RETURN_ON_ERROR(tca_write(TCA9554_OUTPUT_REG, 0xFF), TAG, "tca outputs");
+#endif
     ESP_RETURN_ON_ERROR(tca_reset_pulse(EXIO_LCD_RST_BIT), TAG, "lcd reset");
     ESP_RETURN_ON_ERROR(tca_reset_pulse(EXIO_TOUCH_RST_BIT), TAG, "touch reset");
 
@@ -153,12 +189,14 @@ static esp_err_t init(void)
     /* BOOT is held at flashing time; don't count a held button as a press. */
     s_boot.pressed = gpio_get_level(GPIO_NUM_0) == 0;
 
+#if !CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
     const gpio_config_t pa = {
         .pin_bit_mask = 1ULL << PA_EN,
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&pa), TAG, "pa en");
     ESP_RETURN_ON_ERROR(gpio_set_level(PA_EN, 1), TAG, "pa on");
+#endif
 
     const adc_oneshot_unit_init_cfg_t adc_cfg = { .unit_id = ADC_UNIT_1 };
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&adc_cfg, &s_adc), TAG, "adc");
@@ -260,9 +298,41 @@ static lv_display_t *display_start(lv_indev_t **touch)
     }
     lv_display_add_event_cb(disp, round_area, LV_EVENT_INVALIDATE_AREA, NULL);
 
+    i2c_master_bus_handle_t tp_bus = s_i2c;
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+    /* Find the touch controller; without one, run on BOOT alone rather than
+     * fail the display (which would restart the board in a loop). */
+    if (i2c_master_probe(s_i2c, CST816_ADDR, 100) != ESP_OK) {
+        static i2c_master_bus_handle_t s_tp_i2c;
+        const i2c_master_bus_config_t tp_i2c_cfg = {
+            .i2c_port = I2C_NUM_1,
+            .sda_io_num = TP_ALT_SDA,
+            .scl_io_num = TP_ALT_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        if (!s_tp_i2c && i2c_new_master_bus(&tp_i2c_cfg, &s_tp_i2c) != ESP_OK) {
+            s_tp_i2c = NULL;
+        }
+        if (s_tp_i2c && i2c_master_probe(s_tp_i2c, CST816_ADDR, 100) == ESP_OK) {
+            ESP_LOGI(TAG, "touch: CST816 on its own bus (SDA %d, SCL %d)", TP_ALT_SDA, TP_ALT_SCL);
+            tp_bus = s_tp_i2c;
+        } else {
+            ESP_LOGW(TAG, "touch: no CST816 found; running without touch (BOOT still works)");
+            *touch = NULL;
+            if (esp_lv_adapter_start() != ESP_OK) {
+                return NULL;
+            }
+            return disp;
+        }
+    } else {
+        ESP_LOGI(TAG, "touch: CST816 on the expander's bus");
+    }
+#endif
     esp_lcd_panel_io_handle_t tp_io;
     const esp_lcd_panel_io_i2c_config_t tp_io_cfg = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
-    if (esp_lcd_new_panel_io_i2c(s_i2c, &tp_io_cfg, &tp_io) != ESP_OK) {
+    if (esp_lcd_new_panel_io_i2c(tp_bus, &tp_io_cfg, &tp_io) != ESP_OK) {
         ESP_LOGE(TAG, "touch io");
         return NULL;
     }
@@ -316,6 +386,110 @@ static void display_pause(bool pause)
     }
 }
 
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+/* Plain 1.85: no codec control anywhere, as on the 1.46. The PCM5101A takes
+ * I2S as is, esp_codec_dev adds the volume in software, and the mic gain is
+ * applied here. Both channels run all the time; idle, the speaker sends zeros
+ * (auto_clear). */
+static i2s_chan_handle_t s_tx, s_rx;
+static int32_t s_mic_dc[2];
+static int s_mic_gain_q8 = 256;
+
+static int data_enable(const audio_codec_data_if_t *h, esp_codec_dev_type_t type, bool on)
+{
+    (void)h;
+    (void)type;
+    (void)on;
+    return ESP_CODEC_DEV_OK;
+}
+
+static int spk_write(const audio_codec_data_if_t *h, uint8_t *data, int size)
+{
+    (void)h;
+    size_t wrote;
+    return i2s_channel_write(s_tx, data, size, &wrote, portMAX_DELAY) == ESP_OK ? ESP_CODEC_DEV_OK
+                                                                                : ESP_CODEC_DEV_WRITE_FAIL;
+}
+
+/* A MEMS mic's slot has a small DC offset, which the gain would turn into
+ * clipping: each slot's zero level is tracked and taken off first. */
+static int mic_read(const audio_codec_data_if_t *h, uint8_t *data, int size)
+{
+    (void)h;
+    size_t got;
+    if (i2s_channel_read(s_rx, data, size, &got, pdMS_TO_TICKS(1000)) != ESP_OK || got != (size_t)size) {
+        return ESP_CODEC_DEV_READ_FAIL;
+    }
+    int16_t *s = (int16_t *)data;
+    for (int i = 0; i < size / 2; i++) {
+        int32_t *dc = &s_mic_dc[i & 1];
+        *dc += (s[i] * 256 - *dc) >> 8;
+        int v = (s[i] - (*dc >> 8)) * s_mic_gain_q8 >> 8;
+        s[i] = v > INT16_MAX ? INT16_MAX : v < INT16_MIN ? INT16_MIN : v;
+    }
+    return ESP_CODEC_DEV_OK;
+}
+
+static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
+{
+    (void)mic;
+    s_mic_gain_q8 = (int)(256.0f * powf(10.0f, (db - MIC_GAIN_OFFSET_DB) / 20.0f));
+}
+
+/* Two I2S buses: the PCM5101A on I2S1 with plain 16-bit stereo, the MEMS mic
+ * on I2S0 with the 32-bit slots it needs (each sample is the slot's top
+ * 16 bits). */
+static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
+{
+    i2s_chan_config_t tx_chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    tx_chan.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&tx_chan, &s_tx, NULL), TAG, "i2s tx chan");
+    const i2s_std_config_t tx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SPK_BCLK,
+            .ws = SPK_WS,
+            .dout = SPK_DOUT,
+            .din = I2S_GPIO_UNUSED,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &tx_cfg), TAG, "i2s tx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "i2s tx on");
+
+    i2s_chan_config_t rx_chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* The mic's 32-bit slots double each DMA frame: half the frames keep its
+     * buffers the size the 1.85C's shared bus uses, in internal RAM. */
+    rx_chan.dma_frame_num /= 2;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&rx_chan, NULL, &s_rx), TAG, "i2s rx chan");
+    i2s_std_config_t rx_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MUSE_AUDIO_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MIC_BCLK,
+            .ws = MIC_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din = MIC_DIN,
+        },
+    };
+    rx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    rx_cfg.slot_cfg.ws_width = 32;
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx, &rx_cfg), TAG, "i2s rx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx), TAG, "i2s rx on");
+
+    static const audio_codec_data_if_t spk_if = { .enable = data_enable, .write = spk_write };
+    static const audio_codec_data_if_t mic_if = { .enable = data_enable, .read = mic_read };
+    esp_codec_dev_cfg_t out_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_OUT, .data_if = &spk_if };
+    esp_codec_dev_cfg_t in_cfg = { .dev_type = ESP_CODEC_DEV_TYPE_IN, .data_if = &mic_if };
+    *spk = esp_codec_dev_new(&out_cfg);
+    *mic = esp_codec_dev_new(&in_cfg);
+    ESP_RETURN_ON_FALSE(*spk && *mic, ESP_FAIL, TAG, "codec devs");
+    ESP_LOGI(TAG, "audio: PCM5101A (spk, I2S1) + MEMS mic (I2S0)");
+    return ESP_OK;
+}
+#else
 /*
  * V2 hardware (confirmed by I2C scan 2026-10-02): ES8311 @ 0x18 for speaker
  * (DAC) + ES7210 @ 0x40 for mic (ADC). I2S_NUM_1, MCLK=2, BCLK=48, WS=38,
@@ -383,6 +557,7 @@ static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t 
     ESP_LOGI(TAG, "audio: ES8311 (spk) + ES7210 (mic) on I2S1");
     return ESP_OK;
 }
+#endif
 
 /* Hold-to-talk on the face tile: a finger held on the avatar for
  * TOUCH_HOLD_MS acts as the talk button. Taps and touches on other tiles
@@ -480,7 +655,11 @@ static esp_err_t power_off(void)
 }
 
 static const muse_board_t s_board = {
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+    .name = "Waveshare ESP32-S3-Touch-LCD-1.85",
+#else
     .name = "Waveshare ESP32-S3-Touch-LCD-1.85C",
+#endif
     .width = LCD_RES,
     .height = LCD_RES,
     .round = true,
@@ -498,8 +677,16 @@ static const muse_board_t s_board = {
     .panel_sleep = panel_sleep,
     .display_pause = display_pause,
     .audio_init = audio_init,
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+    .mic_slot = 1,   /* one MEMS mic, on the right slot (as on the 1.46) */
+#else
     .mic_slot = 0,   /* one mic */
+#endif
+#if CONFIG_MUSE_WAVESHARE_S3_185_PCM5101
+    .set_mic_gain = set_mic_gain,   /* software gain in mic_read() */
+#else
     .set_mic_gain = NULL,   /* default: esp_codec_dev_set_in_gain */
+#endif
     .poll_buttons = poll_buttons,
     .wait_buttons = wait_buttons,
     .read_power = read_power,

@@ -177,6 +177,16 @@ menu "Muse"
         default y if !MUSE_BOARD_NONE
         select HOMEHUB_DAEMON_REQUESTS   # voice notes and chat over Link's session
 
+    config MUSE_WAVESHARE_S3_185_PCM5101
+        bool "Plain 1.85 (no C): PCM5101A speaker DAC and MEMS mic"
+        depends on MUSE_BOARD_WAVESHARE_S3_185C
+        default n
+        help
+            The Waveshare ESP32-S3-Touch-LCD-1.85 without the C has the 1.85C's
+            panel, touch and I/O expander, but a PCM5101A I2S DAC for the
+            speaker and a MEMS mic on a second I2S bus (GPIO 15/2/39), like
+            the 1.46. Its chips are printed on the board: PCM5101A means this.
+
     # Always defined, unlike the target-dependent board options, so
     # idf_component.yml rules can select each board's managed components.
     config MUSE_BOARD_ID
