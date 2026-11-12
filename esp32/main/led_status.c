@@ -915,10 +915,23 @@ static esp_err_t lcd_panel_init(void) {
     if (err == ESP_OK) err = esp_lcd_panel_reset(s_panel);
     if (err == ESP_OK) err = esp_lcd_panel_init(s_panel);
 #if CONFIG_HOMEHUB_LED_BACKEND_CYD_ILI9341
-    // This glass needs the column order mirrored (MADCTL MX=1) to match the
-    // orientation TFT_eSPI uses; without it the image is flipped left-right
-    // (e.g. the connected dot lands top-left instead of top-right).
-    if (err == ESP_OK) err = esp_lcd_panel_mirror(s_panel, true, false);
+    // The panel takes writes in landscape (320 wide), so swap its axes to
+    // get the portrait frame this backend draws. Without the swap the right
+    // 80 columns are never written (noise) and the bottom rows fall off the
+    // glass, which hid the bottom status bar. With the swap, no mirroring is
+    // needed for the image to read the right way round (checked on one unit).
+    if (err == ESP_OK) err = esp_lcd_panel_mirror(s_panel, false, false);
+    if (err == ESP_OK) err = esp_lcd_panel_swap_xy(s_panel, true);
+    // RGB LED on the back: R GPIO4, G GPIO16, B GPIO17, active low. GPIO4's
+    // default pull-down lights red faintly, so drive all three high (off).
+    gpio_set_level(4, 1);
+    gpio_set_level(16, 1);
+    gpio_set_level(17, 1);
+    gpio_config_t rgb = {
+        .pin_bit_mask = (1ULL << 4) | (1ULL << 16) | (1ULL << 17),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&rgb);
 #else
     if (err == ESP_OK) err = esp_lcd_panel_invert_color(s_panel, true);
     if (err == ESP_OK) err = esp_lcd_panel_set_gap(s_panel, LCD_X_GAP, 0);

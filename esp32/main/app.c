@@ -762,8 +762,10 @@ static void restart_task(void *arg) {
 // On boards with the full UI, display and audio leave too little internal RAM
 // to hold BLE, Wi-Fi and a TLS handshake at once (the S3's esp-aes DMA buffers fail even
 // with PSRAM). Pairing ends once the credentials are saved, and the device
-// restarts to reach its VM with the BLE stack never started.
-#define PAIR_THEN_RESTART CONFIG_MUSE_ENABLED
+// restarts to reach its VM with the BLE stack never started. The CYD has no
+// PSRAM: with BLE still up its Noise session buffers fail to allocate
+// ("session buffer alloc failed"), so it restarts after pairing too.
+#define PAIR_THEN_RESTART (CONFIG_MUSE_ENABLED || CONFIG_HOMEHUB_LED_BACKEND_CYD_ILI9341)
 
 static char *load_token_unlocked(const char *key) {
     char *buf = calloc(1, TOKEN_BUF_BYTES);
